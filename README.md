@@ -131,6 +131,16 @@ git push origin v1.0.1
 - GitHub: `https://github.com/gaboe/oc-codex-multi-account`
 - npm: `https://www.npmjs.com/package/oc-codex-multi-account`
 
+### Why the `@effect/*` deps are pinned
+
+`@effect/cli` and `@effect/platform-node` declare their sibling `@effect/*`
+packages as **peer** dependencies. Installers that skip peers (e.g.
+`npm install --legacy-peer-deps`, used by some plugin managers) then produce an
+incomplete tree and the CLI fails at runtime with `ERR_MODULE_NOT_FOUND`
+(`@effect/typeclass`, `@effect/printer-ansi`, `@effect/cluster`, …). Pinning them
+as direct dependencies guarantees a complete tree for every installer. Keep the
+versions consistent with `@effect/cli` / `@effect/platform-node`.
+
 ## License
 
 MIT
