@@ -18,6 +18,7 @@ import {
   isRetiredModel,
   pickDefaultModel
 } from './models.js'
+import { ensureOpenCodeAuth } from './opencode-auth.js'
 import { listAccounts, loadStore, updateAccount } from './store.js'
 import { DEFAULT_CONFIG, type AccountCredentials, type PluginConfig } from './types.js'
 
@@ -492,6 +493,18 @@ const MultiAuthPlugin: Plugin = async ({ client, $, project, directory }: Plugin
       }
 	    },
     config: async (config) => {
+      // OpenCode only runs our auth.loader when its own auth store has an entry
+      // for the provider. Accounts added via the CLI live only in the plugin
+      // store, so mirror one into OpenCode's auth here (runs before provider
+      // init) or the provider fails with "OpenAI API key is missing".
+      try {
+        const accounts = listAccounts()
+        const account = accounts.find((a) => a.alias === loadStore().activeAlias) || accounts[0]
+        if (account) ensureOpenCodeAuth(account)
+      } catch {
+        // best-effort repair
+      }
+
       const injectModelsRaw = process.env.OPENCODE_MULTI_AUTH_INJECT_MODELS
       const injectModels = injectModelsRaw === '1' || injectModelsRaw === 'true'
       if (!injectModels) return

@@ -4,6 +4,7 @@ import * as http from 'http';
 import * as url from 'url';
 import { addAccount, updateAccount, loadStore } from './store.js';
 import { clearAuthInvalid } from './rotation.js';
+import { ensureOpenCodeAuth } from './opencode-auth.js';
 import { decodeJwtPayload, getAccountIdFromClaims, getEmailFromClaims, getExpiryFromClaims } from './codex-auth.js';
 // OpenAI OAuth endpoints (same as official Codex CLI)
 const OPENAI_ISSUER = 'https://auth.openai.com';
@@ -117,6 +118,7 @@ export async function loginAccount(alias, flow) {
                     authInvalidatedAt: undefined
                 });
                 const account = store.accounts[alias];
+                ensureOpenCodeAuth(account);
                 res.writeHead(200, { 'Content-Type': 'text/html' });
                 res.end(`
           <html>
@@ -208,6 +210,7 @@ export async function refreshToken(alias) {
         };
         const updatedStore = updateAccount(alias, updates);
         clearAuthInvalid(alias);
+        ensureOpenCodeAuth(updatedStore.accounts[alias]);
         return updatedStore.accounts[alias];
     }
     catch (err) {
@@ -286,6 +289,7 @@ export async function exchangeCodeForTokens(alias, code, verifier) {
         authInvalidatedAt: undefined
     });
     clearAuthInvalid(alias);
+    ensureOpenCodeAuth(store.accounts[alias]);
     return store.accounts[alias];
 }
 //# sourceMappingURL=auth.js.map

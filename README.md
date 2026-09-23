@@ -57,6 +57,20 @@ The first account is treated as primary. Additional accounts are fallbacks.
 - Recovery checks: while on fallback, periodically checks if primary recovered and switches back.
 - Safety skips: temporarily skips accounts that are rate-limited or have auth/model/workspace issues.
 
+## How it connects to OpenCode
+
+OpenCode only calls a plugin's `auth.loader` when its own auth store
+(`~/.local/share/opencode/auth.json`) already has an entry for the provider.
+The plugin registers accounts in its own store, so it also mirrors the active
+account into OpenCode's auth store automatically:
+
+- on `config` (runs at OpenCode startup, before provider init), and
+- whenever an account is added, reauthed or refreshed.
+
+Without that entry OpenCode skips the loader and requests fail with
+`OpenAI API key is missing`. If you ever see that error, restart OpenCode so the
+`config` hook can re-create the entry.
+
 ## Models
 
 The plugin resolves the available models **per account** from the ChatGPT Codex

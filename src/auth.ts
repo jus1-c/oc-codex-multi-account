@@ -5,6 +5,7 @@ import * as url from 'url'
 import * as fs from 'node:fs'
 import { addAccount, updateAccount, loadStore } from './store.js'
 import { clearAuthInvalid } from './rotation.js'
+import { ensureOpenCodeAuth } from './opencode-auth.js'
 import {
   decodeJwtPayload,
   getAccountIdFromClaims,
@@ -157,6 +158,7 @@ export async function loginAccount(
         })
 
         const account = store.accounts[alias]
+        ensureOpenCodeAuth(account)
 
         res.writeHead(200, { 'Content-Type': 'text/html' })
         res.end(`
@@ -259,6 +261,7 @@ export async function refreshToken(alias: string): Promise<AccountCredentials | 
 
     const updatedStore = updateAccount(alias, updates)
     clearAuthInvalid(alias)
+    ensureOpenCodeAuth(updatedStore.accounts[alias])
 
     return updatedStore.accounts[alias]
   } catch (err) {
@@ -352,5 +355,6 @@ export async function exchangeCodeForTokens(
   })
 
   clearAuthInvalid(alias)
+  ensureOpenCodeAuth(store.accounts[alias])
   return store.accounts[alias]
 }
