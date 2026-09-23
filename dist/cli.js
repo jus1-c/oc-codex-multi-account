@@ -6,6 +6,8 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loginAccount, ensureValidToken, createAuthorizationFlow, exchangeCodeForTokens } from "./auth.js";
+import { decodeJwtPayload, getAccountIdFromClaims } from "./codex-auth.js";
+import { pickDefaultModel } from "./models.js";
 import { getStoreConfig, getStorePath, listAccounts, loadStore, removeAccount, resetStoreConfig, updateStoreConfig, } from "./store.js";
 import { disableService, installService, serviceStatus } from "./systemd.js";
 import { DEFAULT_CONFIG } from "./types.js";
@@ -141,17 +143,36 @@ const pingCommand = Command.make("ping", { alias: aliasArg }, ({ alias }) => Eff
                 }));
                 return;
             }
-            // Use /v1/responses (Codex OAuth tokens lack /v1/models permission)
-            const res = await fetch("https://api.openai.com/v1/responses", {
+            // OAuth tokens are only accepted by the ChatGPT Codex backend (the
+            // public api.openai.com endpoints reject them for missing scopes).
+            const accountId = account.accountId ||
+                getAccountIdFromClaims(decodeJwtPayload(token)) ||
+                getAccountIdFromClaims(decodeJwtPayload(account.idToken || ""));
+            if (!accountId) {
+                console.log(JSON.stringify({ status: "error", alias, error: "Missing account id" }));
+                return;
+            }
+            const res = await fetch("https://chatgpt.com/backend-api/codex/responses", {
                 method: "POST",
                 headers: {
                     Authorization: `Bearer ${token}`,
+                    "chatgpt-account-id": accountId,
+                    "OpenAI-Beta": "responses=experimental",
+                    originator: "codex_cli_rs",
+                    accept: "text/event-stream",
                     "Content-Type": "application/json",
                 },
                 body: JSON.stringify({
-                    model: "gpt-5.3-codex",
-                    input: "reply with ok",
-                    max_output_tokens: 1,
+                    model: pickDefaultModel(account),
+                    input: [
+                        {
+                            type: "message",
+                            role: "user",
+                            content: [{ type: "input_text", text: "reply with ok" }],
+                        },
+                    ],
+                    stream: true,
+                    store: false,
                 }),
             });
             // 200 = ok, 429 = rate limited but token works
@@ -166,7 +187,7 @@ const pingCommand = Command.make("ping", { alias: aliasArg }, ({ alias }) => Eff
         }
     },
     catch: (err) => new Error(`Ping command failed: ${err instanceof Error ? err.message : String(err)}`),
-})).pipe(Command.withDescription("Check account token against OpenAI API"));
+})).pipe(Command.withDescription("Check account token against the ChatGPT Codex backend"));
 const reauthCommand = Command.make("reauth", {
     alias: aliasArg,
     callback: Options.text("callback").pipe(Options.optional),

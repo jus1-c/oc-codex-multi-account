@@ -1,144 +1,167 @@
-import type { OpenAIModel, ProviderModel } from './types.js'
+import { loadStore, updateAccount } from './store.js'
+import type { AccountCredentials, ModelCatalogEntry } from './types.js'
 
-const MODELS_ENDPOINT = 'https://api.openai.com/v1/models'
+// The ChatGPT Codex backend gates its model catalog on the caller's client
+// version. Sending an old version returns an empty list, so keep this current
+// with the Codex CLI releases and allow an env override.
+const CODEX_CLIENT_VERSION =
+  (process.env.OPENCODE_MULTI_AUTH_CODEX_CLIENT_VERSION || '0.156.1').trim()
 
-const REASONING_LEVELS = ['none', 'low', 'medium', 'high', 'xhigh'] as const
-type ReasoningLevel = typeof REASONING_LEVELS[number]
+const CATALOG_BASE_URL = 'https://chatgpt.com/backend-api/codex/models'
+const CATALOG_TTL_MS = 12 * 60 * 60 * 1000
 
-const MODEL_LIMITS: Record<string, { context: number; output: number }> = {
-  'gpt-5.2': { context: 272000, output: 128000 },
-  'gpt-5.2-codex': { context: 272000, output: 128000 },
-  'gpt-5.1': { context: 272000, output: 128000 },
-  'gpt-5.1-codex': { context: 272000, output: 128000 },
-  'gpt-5.1-codex-max': { context: 272000, output: 128000 },
-  'gpt-5.1-codex-mini': { context: 272000, output: 128000 },
+// Used only when the catalog endpoint is unreachable. These are the models
+// verified callable on a ChatGPT (Kimi OAuth) account as of 2026-09.
+const DEFAULT_CATALOG_SLUGS = [
+  'gpt-6-astra',
+  'gpt-6-luna',
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+  'gpt-5.5'
+]
+
+// Models retired from Codex when signing in with a ChatGPT account. Requests
+// for these 400 with "model is not supported when using Codex with a ChatGPT
+// account", so they must be remapped to a currently available model.
+const RETIRED_MODEL_PATTERNS: RegExp[] = [
+  /^gpt-5$/,
+  /^gpt-5-(mini|nano|pro)$/,
+  /^gpt-5\.1($|-)/,
+  /^gpt-5\.2($|-)/,
+  /^gpt-5\.3($|-)/,
+  /^gpt-5\.4($|-)/,
+  /^gpt-5\.5-pro$/,
+  /^gpt-5\.6$/,
+  /^gpt-5-codex$/,
+  /^gpt-5\.1-codex(-max|-mini)?$/,
+  /^gpt-5\.2-codex$/,
+  /^gpt-5\.3-codex(-spark)?$/
+]
+
+export function isRetiredModel(modelId: string): boolean {
+  const base = modelId.includes('/') ? modelId.split('/').pop()! : modelId
+  return RETIRED_MODEL_PATTERNS.some((pattern) => pattern.test(base))
 }
 
-function getModelLimits(modelId: string): { context: number; output: number } {
-  for (const [prefix, limits] of Object.entries(MODEL_LIMITS)) {
-    if (modelId.startsWith(prefix)) return limits
+interface RawCatalogModel {
+  slug?: string
+  display_name?: string
+  context_window?: number
+  max_context_window?: number
+  visibility?: string
+  priority?: number
+  supported_reasoning_levels?: Array<{ effort?: string }>
+}
+
+export async function fetchCodexCatalog(
+  token: string,
+  accountId: string | undefined
+): Promise<ModelCatalogEntry[]> {
+  const url = `${CATALOG_BASE_URL}?client_version=${encodeURIComponent(CODEX_CLIENT_VERSION)}`
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+    originator: 'codex_cli_rs'
   }
-  return { context: 128000, output: 32000 }
-}
+  if (accountId) headers['chatgpt-account-id'] = accountId
 
-function buildProviderModel(baseId: string, reasoning: ReasoningLevel): ProviderModel {
-  const limits = getModelLimits(baseId)
-  const displayName = `${baseId} ${reasoning.charAt(0).toUpperCase() + reasoning.slice(1)} (OAuth)`
-
-  return {
-    name: displayName,
-    limit: limits,
-    modalities: {
-      input: ['text', 'image'],
-      output: ['text']
-    },
-    options: {
-      reasoningEffort: reasoning,
-      reasoningSummary: reasoning === 'high' || reasoning === 'xhigh' ? 'detailed' : 'auto',
-      textVerbosity: 'medium',
-      include: ['reasoning.encrypted_content'],
-      store: false
-    }
-  }
-}
-
-export async function fetchAvailableModels(token: string): Promise<OpenAIModel[]> {
   try {
-    const res = await fetch(MODELS_ENDPOINT, {
-      headers: { Authorization: `Bearer ${token}` }
-    })
-
+    const res = await fetch(url, { headers })
     if (!res.ok) {
-      console.error(`[multi-auth] Failed to fetch models: ${res.status}`)
+      if (process.env.OPENCODE_MULTI_AUTH_DEBUG === '1') {
+        console.error(`[multi-auth] catalog fetch failed: ${res.status}`)
+      }
       return []
     }
-
-    const data = (await res.json()) as { data?: OpenAIModel[] }
-    return data.data || []
+    const data = (await res.json()) as { models?: RawCatalogModel[] }
+    const models = Array.isArray(data?.models) ? data.models : []
+    return models
+      .filter((m) => typeof m.slug === 'string' && m.visibility === 'list')
+      .map((m) => ({
+        slug: m.slug!,
+        displayName: m.display_name || m.slug!,
+        contextWindow: m.context_window,
+        maxContextWindow: m.max_context_window,
+        reasoningLevels: (m.supported_reasoning_levels || [])
+          .map((l) => l?.effort)
+          .filter((e): e is string => typeof e === 'string'),
+        priority: m.priority,
+        visibility: m.visibility
+      }))
   } catch (err) {
-    console.error('[multi-auth] Error fetching models:', err)
+    if (process.env.OPENCODE_MULTI_AUTH_DEBUG === '1') {
+      console.error('[multi-auth] catalog fetch error:', err)
+    }
     return []
   }
 }
 
-export function filterGPT5Models(models: OpenAIModel[]): OpenAIModel[] {
-  return models.filter(m => m.id.match(/^gpt-5/))
+export async function getCodexCatalog(
+  account: AccountCredentials,
+  options?: { force?: boolean }
+): Promise<ModelCatalogEntry[]> {
+  const cached = account.catalog
+  const fetchedAt = account.catalogFetchedAt || 0
+  if (!options?.force && cached && cached.length > 0 && Date.now() - fetchedAt < CATALOG_TTL_MS) {
+    return cached
+  }
+
+  const fresh = await fetchCodexCatalog(account.accessToken, account.accountId)
+  if (fresh.length > 0) {
+    try {
+      updateAccount(account.alias, { catalog: fresh, catalogFetchedAt: Date.now() })
+    } catch {
+      // store write is best-effort; still return the fresh list
+    }
+    return fresh
+  }
+
+  return cached && cached.length > 0 ? cached : []
 }
 
-export function generateModelVariants(baseModels: OpenAIModel[]): Record<string, ProviderModel> {
-  const result: Record<string, ProviderModel> = {}
-
-  for (const model of baseModels) {
-    const baseId = model.id
-    const isCodex = baseId.includes('codex')
-
-    const levels: ReasoningLevel[] = isCodex
-      ? ['low', 'medium', 'high', 'xhigh']
-      : ['none', 'low', 'medium', 'high', 'xhigh']
-
-    for (const level of levels) {
-      const variantId = `${baseId}-${level}`
-      result[variantId] = buildProviderModel(baseId, level)
-    }
+export function getCatalogSlugs(account: AccountCredentials): string[] {
+  const cached = account.catalog
+  if (cached && cached.length > 0) {
+    return cached.map((entry) => entry.slug)
   }
-
-  return result
+  return DEFAULT_CATALOG_SLUGS
 }
 
-export function getDefaultModels(): Record<string, ProviderModel> {
-  const defaults = [
-    'gpt-5.2',
-    'gpt-5.2-codex',
-    'gpt-5.1',
-    'gpt-5.1-codex',
-    'gpt-5.1-codex-max',
-    'gpt-5.1-codex-mini'
-  ]
+/**
+ * Pick the model to route a retired/unknown request to.
+ * Priority: explicit env override > gpt-6-astra (when the account has it) >
+ * lowest catalog priority > gpt-5.6-sol.
+ */
+export function pickDefaultModel(account: AccountCredentials): string {
+  const override = (process.env.OPENCODE_MULTI_AUTH_CODEX_LATEST_MODEL || '').trim()
+  const catalog = account.catalog && account.catalog.length > 0 ? account.catalog : null
 
-  const result: Record<string, ProviderModel> = {}
-
-  for (const baseId of defaults) {
-    const isCodex = baseId.includes('codex')
-    const levels: ReasoningLevel[] = isCodex
-      ? ['low', 'medium', 'high', 'xhigh']
-      : ['none', 'low', 'medium', 'high', 'xhigh']
-
-    for (const level of levels) {
-      if (baseId === 'gpt-5.1-codex-mini' && !['medium', 'high'].includes(level)) continue
-      if (baseId === 'gpt-5.1-codex' && level === 'xhigh') continue
-      if (baseId === 'gpt-5.1' && level === 'xhigh') continue
-
-      const variantId = `${baseId}-${level}`
-      result[variantId] = buildProviderModel(baseId, level)
-    }
+  if (override) {
+    if (!catalog || catalog.some((entry) => entry.slug === override)) return override
   }
 
-  return result
+  if (catalog) {
+    if (catalog.some((entry) => entry.slug === 'gpt-6-astra')) return 'gpt-6-astra'
+    const sorted = [...catalog].sort((a, b) => (a.priority ?? 999) - (b.priority ?? 999))
+    if (sorted[0]?.slug) return sorted[0].slug
+  }
+
+  return override || 'gpt-6-astra'
 }
 
-let cachedModels: Record<string, ProviderModel> | null = null
-let cacheExpiry = 0
+export function getCatalogContextWindow(
+  account: AccountCredentials,
+  slug: string
+): number | undefined {
+  const entry = account.catalog?.find((m) => m.slug === slug)
+  return entry?.contextWindow
+}
 
-export async function getModels(token?: string): Promise<Record<string, ProviderModel>> {
-  const now = Date.now()
-  const CACHE_TTL = 60 * 60 * 1000
-
-  if (cachedModels && now < cacheExpiry) {
-    return cachedModels
+export function getKnownCatalogSlugs(): string[] {
+  const store = loadStore()
+  const slugs = new Set<string>()
+  for (const account of Object.values(store.accounts)) {
+    for (const entry of account.catalog || []) slugs.add(entry.slug)
   }
-
-  if (token) {
-    const fetched = await fetchAvailableModels(token)
-    const gpt5 = filterGPT5Models(fetched)
-
-    if (gpt5.length > 0) {
-      cachedModels = generateModelVariants(gpt5)
-      cacheExpiry = now + CACHE_TTL
-      return cachedModels
-    }
-  }
-
-  cachedModels = getDefaultModels()
-  cacheExpiry = now + CACHE_TTL
-  return cachedModels
+  return slugs.size > 0 ? [...slugs] : DEFAULT_CATALOG_SLUGS
 }

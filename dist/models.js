@@ -1,121 +1,137 @@
-const MODELS_ENDPOINT = 'https://api.openai.com/v1/models';
-const REASONING_LEVELS = ['none', 'low', 'medium', 'high', 'xhigh'];
-const MODEL_LIMITS = {
-    'gpt-5.2': { context: 272000, output: 128000 },
-    'gpt-5.2-codex': { context: 272000, output: 128000 },
-    'gpt-5.1': { context: 272000, output: 128000 },
-    'gpt-5.1-codex': { context: 272000, output: 128000 },
-    'gpt-5.1-codex-max': { context: 272000, output: 128000 },
-    'gpt-5.1-codex-mini': { context: 272000, output: 128000 },
-};
-function getModelLimits(modelId) {
-    for (const [prefix, limits] of Object.entries(MODEL_LIMITS)) {
-        if (modelId.startsWith(prefix))
-            return limits;
-    }
-    return { context: 128000, output: 32000 };
+import { loadStore, updateAccount } from './store.js';
+// The ChatGPT Codex backend gates its model catalog on the caller's client
+// version. Sending an old version returns an empty list, so keep this current
+// with the Codex CLI releases and allow an env override.
+const CODEX_CLIENT_VERSION = (process.env.OPENCODE_MULTI_AUTH_CODEX_CLIENT_VERSION || '0.156.1').trim();
+const CATALOG_BASE_URL = 'https://chatgpt.com/backend-api/codex/models';
+const CATALOG_TTL_MS = 12 * 60 * 60 * 1000;
+// Used only when the catalog endpoint is unreachable. These are the models
+// verified callable on a ChatGPT (Kimi OAuth) account as of 2026-09.
+const DEFAULT_CATALOG_SLUGS = [
+    'gpt-6-astra',
+    'gpt-6-luna',
+    'gpt-5.6-sol',
+    'gpt-5.6-terra',
+    'gpt-5.6-luna',
+    'gpt-5.5'
+];
+// Models retired from Codex when signing in with a ChatGPT account. Requests
+// for these 400 with "model is not supported when using Codex with a ChatGPT
+// account", so they must be remapped to a currently available model.
+const RETIRED_MODEL_PATTERNS = [
+    /^gpt-5$/,
+    /^gpt-5-(mini|nano|pro)$/,
+    /^gpt-5\.1($|-)/,
+    /^gpt-5\.2($|-)/,
+    /^gpt-5\.3($|-)/,
+    /^gpt-5\.4($|-)/,
+    /^gpt-5\.5-pro$/,
+    /^gpt-5\.6$/,
+    /^gpt-5-codex$/,
+    /^gpt-5\.1-codex(-max|-mini)?$/,
+    /^gpt-5\.2-codex$/,
+    /^gpt-5\.3-codex(-spark)?$/
+];
+export function isRetiredModel(modelId) {
+    const base = modelId.includes('/') ? modelId.split('/').pop() : modelId;
+    return RETIRED_MODEL_PATTERNS.some((pattern) => pattern.test(base));
 }
-function buildProviderModel(baseId, reasoning) {
-    const limits = getModelLimits(baseId);
-    const displayName = `${baseId} ${reasoning.charAt(0).toUpperCase() + reasoning.slice(1)} (OAuth)`;
-    return {
-        name: displayName,
-        limit: limits,
-        modalities: {
-            input: ['text', 'image'],
-            output: ['text']
-        },
-        options: {
-            reasoningEffort: reasoning,
-            reasoningSummary: reasoning === 'high' || reasoning === 'xhigh' ? 'detailed' : 'auto',
-            textVerbosity: 'medium',
-            include: ['reasoning.encrypted_content'],
-            store: false
-        }
+export async function fetchCodexCatalog(token, accountId) {
+    const url = `${CATALOG_BASE_URL}?client_version=${encodeURIComponent(CODEX_CLIENT_VERSION)}`;
+    const headers = {
+        Authorization: `Bearer ${token}`,
+        originator: 'codex_cli_rs'
     };
-}
-export async function fetchAvailableModels(token) {
+    if (accountId)
+        headers['chatgpt-account-id'] = accountId;
     try {
-        const res = await fetch(MODELS_ENDPOINT, {
-            headers: { Authorization: `Bearer ${token}` }
-        });
+        const res = await fetch(url, { headers });
         if (!res.ok) {
-            console.error(`[multi-auth] Failed to fetch models: ${res.status}`);
+            if (process.env.OPENCODE_MULTI_AUTH_DEBUG === '1') {
+                console.error(`[multi-auth] catalog fetch failed: ${res.status}`);
+            }
             return [];
         }
         const data = (await res.json());
-        return data.data || [];
+        const models = Array.isArray(data?.models) ? data.models : [];
+        return models
+            .filter((m) => typeof m.slug === 'string' && m.visibility === 'list')
+            .map((m) => ({
+            slug: m.slug,
+            displayName: m.display_name || m.slug,
+            contextWindow: m.context_window,
+            maxContextWindow: m.max_context_window,
+            reasoningLevels: (m.supported_reasoning_levels || [])
+                .map((l) => l?.effort)
+                .filter((e) => typeof e === 'string'),
+            priority: m.priority,
+            visibility: m.visibility
+        }));
     }
     catch (err) {
-        console.error('[multi-auth] Error fetching models:', err);
+        if (process.env.OPENCODE_MULTI_AUTH_DEBUG === '1') {
+            console.error('[multi-auth] catalog fetch error:', err);
+        }
         return [];
     }
 }
-export function filterGPT5Models(models) {
-    return models.filter(m => m.id.match(/^gpt-5/));
-}
-export function generateModelVariants(baseModels) {
-    const result = {};
-    for (const model of baseModels) {
-        const baseId = model.id;
-        const isCodex = baseId.includes('codex');
-        const levels = isCodex
-            ? ['low', 'medium', 'high', 'xhigh']
-            : ['none', 'low', 'medium', 'high', 'xhigh'];
-        for (const level of levels) {
-            const variantId = `${baseId}-${level}`;
-            result[variantId] = buildProviderModel(baseId, level);
+export async function getCodexCatalog(account, options) {
+    const cached = account.catalog;
+    const fetchedAt = account.catalogFetchedAt || 0;
+    if (!options?.force && cached && cached.length > 0 && Date.now() - fetchedAt < CATALOG_TTL_MS) {
+        return cached;
+    }
+    const fresh = await fetchCodexCatalog(account.accessToken, account.accountId);
+    if (fresh.length > 0) {
+        try {
+            updateAccount(account.alias, { catalog: fresh, catalogFetchedAt: Date.now() });
         }
-    }
-    return result;
-}
-export function getDefaultModels() {
-    const defaults = [
-        'gpt-5.2',
-        'gpt-5.2-codex',
-        'gpt-5.1',
-        'gpt-5.1-codex',
-        'gpt-5.1-codex-max',
-        'gpt-5.1-codex-mini'
-    ];
-    const result = {};
-    for (const baseId of defaults) {
-        const isCodex = baseId.includes('codex');
-        const levels = isCodex
-            ? ['low', 'medium', 'high', 'xhigh']
-            : ['none', 'low', 'medium', 'high', 'xhigh'];
-        for (const level of levels) {
-            if (baseId === 'gpt-5.1-codex-mini' && !['medium', 'high'].includes(level))
-                continue;
-            if (baseId === 'gpt-5.1-codex' && level === 'xhigh')
-                continue;
-            if (baseId === 'gpt-5.1' && level === 'xhigh')
-                continue;
-            const variantId = `${baseId}-${level}`;
-            result[variantId] = buildProviderModel(baseId, level);
+        catch {
+            // store write is best-effort; still return the fresh list
         }
+        return fresh;
     }
-    return result;
+    return cached && cached.length > 0 ? cached : [];
 }
-let cachedModels = null;
-let cacheExpiry = 0;
-export async function getModels(token) {
-    const now = Date.now();
-    const CACHE_TTL = 60 * 60 * 1000;
-    if (cachedModels && now < cacheExpiry) {
-        return cachedModels;
+export function getCatalogSlugs(account) {
+    const cached = account.catalog;
+    if (cached && cached.length > 0) {
+        return cached.map((entry) => entry.slug);
     }
-    if (token) {
-        const fetched = await fetchAvailableModels(token);
-        const gpt5 = filterGPT5Models(fetched);
-        if (gpt5.length > 0) {
-            cachedModels = generateModelVariants(gpt5);
-            cacheExpiry = now + CACHE_TTL;
-            return cachedModels;
-        }
+    return DEFAULT_CATALOG_SLUGS;
+}
+/**
+ * Pick the model to route a retired/unknown request to.
+ * Priority: explicit env override > gpt-6-astra (when the account has it) >
+ * lowest catalog priority > gpt-5.6-sol.
+ */
+export function pickDefaultModel(account) {
+    const override = (process.env.OPENCODE_MULTI_AUTH_CODEX_LATEST_MODEL || '').trim();
+    const catalog = account.catalog && account.catalog.length > 0 ? account.catalog : null;
+    if (override) {
+        if (!catalog || catalog.some((entry) => entry.slug === override))
+            return override;
     }
-    cachedModels = getDefaultModels();
-    cacheExpiry = now + CACHE_TTL;
-    return cachedModels;
+    if (catalog) {
+        if (catalog.some((entry) => entry.slug === 'gpt-6-astra'))
+            return 'gpt-6-astra';
+        const sorted = [...catalog].sort((a, b) => (a.priority ?? 999) - (b.priority ?? 999));
+        if (sorted[0]?.slug)
+            return sorted[0].slug;
+    }
+    return override || 'gpt-6-astra';
+}
+export function getCatalogContextWindow(account, slug) {
+    const entry = account.catalog?.find((m) => m.slug === slug);
+    return entry?.contextWindow;
+}
+export function getKnownCatalogSlugs() {
+    const store = loadStore();
+    const slugs = new Set();
+    for (const account of Object.values(store.accounts)) {
+        for (const entry of account.catalog || [])
+            slugs.add(entry.slug);
+    }
+    return slugs.size > 0 ? [...slugs] : DEFAULT_CATALOG_SLUGS;
 }
 //# sourceMappingURL=models.js.map

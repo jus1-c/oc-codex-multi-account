@@ -3,6 +3,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { spawn } from 'node:child_process'
 import { findLatestSessionRateLimits } from './sessions-limits.js'
+import { getCatalogSlugs } from './models.js'
 import type { AccountCredentials, AccountRateLimits } from './types.js'
 
 const CODEX_HOME_ROOT = path.join(os.homedir(), '.codex-multi')
@@ -10,7 +11,6 @@ const CODEX_CONFIG_PATH = path.join(os.homedir(), '.codex', 'config.toml')
 
 const DEFAULT_PROMPT = 'Reply ONLY with OK. Do not run any commands.'
 const EXEC_TIMEOUT_MS = 120_000
-const DEFAULT_PROBE_MODELS = ['gpt-5-codex', 'gpt-5.2-codex', 'gpt-5.3-codex']
 
 export interface ProbeResult {
   rateLimits?: AccountRateLimits
@@ -72,14 +72,14 @@ function shouldRetryWithFallback(error?: string): boolean {
   )
 }
 
-function getProbeModels(): string[] {
+function getProbeModels(account: AccountCredentials): string[] {
   const raw = (process.env.OPENCODE_MULTI_AUTH_LIMITS_PROBE_MODELS || '').trim()
   const fromEnv = raw
     .split(',')
     .map((item) => item.trim())
     .filter(Boolean)
 
-  const candidates = fromEnv.length > 0 ? fromEnv : DEFAULT_PROBE_MODELS
+  const candidates = fromEnv.length > 0 ? fromEnv : getCatalogSlugs(account).slice(0, 3)
   return Array.from(new Set(candidates))
 }
 
@@ -147,7 +147,7 @@ export async function probeRateLimitsForAccount(account: AccountCredentials): Pr
   copyConfigToml(codexHome)
 
   const sessionsDir = path.join(codexHome, 'sessions')
-  const probeModels = getProbeModels()
+  const probeModels = getProbeModels(account)
   let lastError = 'No token_count events found in alias sessions'
   const attemptErrors: string[] = []
 

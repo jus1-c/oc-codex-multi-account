@@ -10,8 +10,16 @@ import {
   markRateLimited,
   markWorkspaceDeactivated
 } from './rotation.js'
-import { listAccounts, updateAccount } from './store.js'
-import { DEFAULT_CONFIG, type PluginConfig } from './types.js'
+import {
+  getCatalogContextWindow,
+  getCatalogSlugs,
+  getCodexCatalog,
+  getKnownCatalogSlugs,
+  isRetiredModel,
+  pickDefaultModel
+} from './models.js'
+import { listAccounts, loadStore, updateAccount } from './store.js'
+import { DEFAULT_CONFIG, type AccountCredentials, type PluginConfig } from './types.js'
 
 const PROVIDER_ID = 'openai'
 const CODEX_BASE_URL = 'https://chatgpt.com/backend-api'
@@ -58,10 +66,6 @@ function extractRequestUrl(input: Request | string | URL): string {
   return input.url
 }
 
-function rewriteUrlForCodex(url: string): string {
-  return url.replace(URL_PATHS.RESPONSES, URL_PATHS.CODEX_RESPONSES)
-}
-
 function extractPathAndSearch(url: string): string {
   // OpenCode sometimes passes relative paths (e.g. "/chat/completions") or even
   // malformed strings when provider base_url is missing (e.g. "undefined/...").
@@ -95,6 +99,10 @@ function toCodexBackendUrl(originalUrl: string): string {
 }
 
 function filterInput(input: unknown): unknown {
+  // The Codex backend rejects a plain string input with "Input must be a list".
+  if (typeof input === 'string') {
+    return [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: input }] }]
+  }
   if (!Array.isArray(input)) return input
   return input
     .filter((item) => item?.type !== 'item_reference')
@@ -107,28 +115,20 @@ function filterInput(input: unknown): unknown {
     })
 }
 
-function normalizeModel(model: string | undefined): string {
-  if (!model) return 'gpt-5.1'
+function normalizeModel(model: string | undefined, account: AccountCredentials): string {
+  if (!model) return pickDefaultModel(account)
 
   const modelId = model.includes('/') ? model.split('/').pop()! : model
-  const baseModel = modelId.replace(/-(?:none|low|medium|high|xhigh)$/, '')
+  const baseModel = modelId.replace(/-(?:none|minimal|low|medium|high|xhigh|max|ultra)$/, '')
 
-  // OpenCode currently allowlists gpt-5.2-codex, but we can route it to the latest
-  // Codex model on the ChatGPT backend for users who want the newest model without
-  // waiting for upstream registry updates.
-  const preferLatestRaw = process.env.OPENCODE_MULTI_AUTH_PREFER_CODEX_LATEST
-  const preferLatest = preferLatestRaw !== '0' && preferLatestRaw !== 'false'
-
-  if (preferLatest && (baseModel === 'gpt-5.2-codex' || baseModel === 'gpt-5-codex')) {
-    const latestModel = (
-      process.env.OPENCODE_MULTI_AUTH_CODEX_LATEST_MODEL || 'gpt-5.3-codex'
-    ).trim()
-
+  // Models retired from Codex with ChatGPT sign-in 400 on the backend. Route
+  // them to a model this account can actually call.
+  if (isRetiredModel(baseModel)) {
+    const fallback = pickDefaultModel(account)
     if (process.env.OPENCODE_MULTI_AUTH_DEBUG === '1') {
-      console.log(`[multi-auth] model map: ${baseModel} -> ${latestModel}`)
+      console.log(`[multi-auth] model map: ${baseModel} -> ${fallback} (retired)`)
     }
-
-    return latestModel
+    return fallback
   }
 
   return baseModel
@@ -491,41 +491,73 @@ const MultiAuthPlugin: Plugin = async ({ client, $, project, directory }: Plugin
         lastStatusBySession.set(sessionID, 'idle')
       }
 	    },
-	    config: async (config) => {
-	      const injectModelsRaw = process.env.OPENCODE_MULTI_AUTH_INJECT_MODELS
-	      const injectModels = injectModelsRaw === '1' || injectModelsRaw === 'true'
-	      if (!injectModels) return
+    config: async (config) => {
+      const injectModelsRaw = process.env.OPENCODE_MULTI_AUTH_INJECT_MODELS
+      const injectModels = injectModelsRaw === '1' || injectModelsRaw === 'true'
+      if (!injectModels) return
 
-	      const latestModel = (process.env.OPENCODE_MULTI_AUTH_CODEX_LATEST_MODEL || 'gpt-5.3-codex').trim()
-	      try {
-	        const openai = (config.provider?.[PROVIDER_ID] as any) || null
-	        if (!openai || typeof openai !== 'object') return
-	        openai.models ||= {}
+      try {
+        const openai = (config.provider?.[PROVIDER_ID] as any) || null
+        if (!openai || typeof openai !== 'object') return
+        openai.models ||= {}
 
-	        if (!openai.models[latestModel]) {
-	          openai.models[latestModel] = {
-	            id: latestModel,
-	            name: 'GPT-5.3 Codex',
-	            reasoning: true,
-	            tool_call: true,
-	            temperature: true,
-	            limit: {
-	              // Be conservative: upstream model metadata changes over time and
-	              // incorrect limits prevent OpenCode's compaction from triggering.
-	              context: 200000,
-	              output: 8192
-	            }
-	          }
-	        }
+        const accounts = listAccounts()
+        const account = accounts.find((a) => a.alias === loadStore().activeAlias) || accounts[0]
+        if (!account) return
+        const catalog = account.catalog || []
+        const entries = catalog.length > 0
+          ? catalog
+          : getCatalogSlugs(account).map((slug) => ({ slug, displayName: slug }))
 
-	        if (process.env.OPENCODE_MULTI_AUTH_DEBUG === '1') {
-	          console.log(`[multi-auth] injected ${latestModel} into runtime config`)
-	        }
-	      } catch (err) {
+        for (const entry of entries) {
+          const modelId = entry.slug
+          if (openai.models[modelId]) continue
+          openai.models[modelId] = {
+            id: modelId,
+            name: entry.displayName || modelId,
+            reasoning: true,
+            tool_call: true,
+            temperature: true,
+            limit: {
+              context: getCatalogContextWindow(account, modelId) || 200000,
+              output: 8192
+            }
+          }
+        }
+
+        if (process.env.OPENCODE_MULTI_AUTH_DEBUG === '1') {
+          console.log(`[multi-auth] injected ${entries.length} catalog models into runtime config`)
+        }
+      } catch (err) {
         if (process.env.OPENCODE_MULTI_AUTH_DEBUG === '1') {
           console.log('[multi-auth] config injection failed:', err)
         }
       }
+    },
+
+    // Restrict the OpenAI model picker to models the active account can actually
+    // call. OpenCode's models.dev catalog still lists retired Codex models which
+    // the ChatGPT backend rejects with HTTP 400.
+    provider: {
+      id: PROVIDER_ID,
+      async models(provider, ctx) {
+        if (ctx.auth?.type !== 'oauth') return provider.models
+
+        const allowed = new Set(getKnownCatalogSlugs())
+        const filtered = Object.fromEntries(
+          Object.entries(provider.models).filter(([, model]) => allowed.has(model.api.id))
+        )
+
+        // Never return an empty catalog: fall back to the unfiltered list so the
+        // user can still pick a model if the catalog lookup failed.
+        return Object.keys(filtered).length > 0 ? filtered : provider.models
+      }
+    },
+
+    // Match Codex CLI: do not send a max output token cap.
+    "chat.params": async (input, output) => {
+      if (input.model.providerID !== PROVIDER_ID) return
+      output.maxOutputTokens = undefined
     },
 
     auth: {
@@ -541,6 +573,18 @@ const MultiAuthPlugin: Plugin = async ({ client, $, project, directory }: Plugin
         if (accounts.length === 0) {
           console.log('[multi-auth] No accounts configured. Run: opencode-multi-auth add <alias>')
           return {}
+        }
+
+        // Warm the model catalog for the active account so the provider hook and
+        // model normalization have accurate, per-account data.
+        const activeAccount =
+          accounts.find((a) => a.alias === loadStore().activeAlias) || accounts[0]
+        if (activeAccount) {
+          try {
+            await getCodexCatalog(activeAccount)
+          } catch {
+            // catalog warm-up is best-effort
+          }
         }
 
         // Custom fetch with multi-account rotation
@@ -579,12 +623,16 @@ const MultiAuthPlugin: Plugin = async ({ client, $, project, directory }: Plugin
           }
 
           const isStreaming = body?.stream === true
-          const normalizedModel = normalizeModel(body.model)
-          const reasoningMatch = body.model?.match(/-(none|low|medium|high|xhigh)$/)
+          const normalizedModel = normalizeModel(body.model, account)
+          const reasoningMatch = body.model?.match(/-(none|minimal|low|medium|high|xhigh|max|ultra)$/)
 
 	          const payload: Record<string, any> = {
 	            ...body,
 	            model: normalizedModel,
+	            // The ChatGPT Codex backend rejects non-streaming requests with
+	            // "Stream must be set to true". Always stream; non-streaming
+	            // callers are served by converting the SSE response to JSON below.
+	            stream: true,
 	            store: false
 	          }
 
@@ -732,26 +780,33 @@ const MultiAuthPlugin: Plugin = async ({ client, $, project, directory }: Plugin
               }
             }
 
-            if (res.status === 400) {
-              // Some accounts get staged access to newer Codex models (e.g. gpt-5.3-codex).
-              // If the backend says the model isn't supported for this account, temporarily
-              // skip it instead of trapping the whole rotation on a permanent 400 loop.
+            if (res.status === 400 || res.status === 404) {
+              // Some accounts get staged access to newer Codex models. If the
+              // backend says the model isn't supported (400) or doesn't exist
+              // (404 model_not_found) for this account, temporarily skip it
+              // instead of trapping the whole rotation on a permanent error.
               const errorData = await res.clone().json().catch(() => ({})) as any
+              const code =
+                (typeof errorData?.error?.code === 'string' && errorData.error.code) ||
+                (typeof errorData?.detail?.code === 'string' && errorData.detail.code) ||
+                (typeof errorData?.code === 'string' && errorData.code) ||
+                ''
               const message =
                 (typeof errorData?.detail === 'string' && errorData.detail) ||
                 (typeof errorData?.error?.message === 'string' && errorData.error.message) ||
                 (typeof errorData?.message === 'string' && errorData.message) ||
                 ''
+              const lowered = message.toLowerCase()
 
               const isModelUnsupported =
-                typeof message === 'string' &&
-                message.toLowerCase().includes('model is not supported') &&
-                message.toLowerCase().includes('chatgpt account')
+                code === 'model_not_found' ||
+                (lowered.includes('model is not supported') && lowered.includes('chatgpt account')) ||
+                lowered.includes('does not exist or you do not have access')
 
               if (isModelUnsupported) {
                 markModelUnsupported(account.alias, pluginConfig.modelUnsupportedCooldownMs, {
                   model: normalizedModel,
-                  error: message
+                  error: message || code
                 })
 
                 const retryRotation = await getNextAccount(pluginConfig)
@@ -762,10 +817,10 @@ const MultiAuthPlugin: Plugin = async ({ client, $, project, directory }: Plugin
                 return new Response(
                   JSON.stringify({
                     error: {
-                      message: `[multi-auth] Model not supported on all accounts. ${message}`.trim()
+                      message: `[multi-auth] Model not supported on all accounts. ${message || code}`.trim()
                     }
                   }),
-                  { status: 400, headers: { 'Content-Type': 'application/json' } }
+                  { status: res.status, headers: { 'Content-Type': 'application/json' } }
                 )
               }
             }

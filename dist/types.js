@@ -7,6 +7,6 @@ export const DEFAULT_CONFIG = {
     stickyThresholdFiveHour: 0.7,
     stickyThresholdWeekly: 0.7,
     stickyRecoveryCheckIntervalMs: 60 * 60 * 1000,
-    modelFilter: /^gpt-5/
+    modelFilter: /^gpt-(5|6)/
 };
 //# sourceMappingURL=types.js.map

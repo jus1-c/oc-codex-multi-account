@@ -34,6 +34,21 @@ export interface AccountCredentials {
   tags?: string[]
   notes?: string
   source?: 'opencode' | 'codex'
+  // Per-account model catalog resolved from the ChatGPT Codex backend
+  // (GET /backend-api/codex/models). Cached to avoid guessing which models an
+  // account can actually call.
+  catalog?: ModelCatalogEntry[]
+  catalogFetchedAt?: number
+}
+
+export interface ModelCatalogEntry {
+  slug: string
+  displayName: string
+  contextWindow?: number
+  maxContextWindow?: number
+  reasoningLevels: string[]
+  priority?: number
+  visibility?: string
 }
 
 export interface RateLimitWindow {
@@ -65,14 +80,6 @@ export interface AccountStore {
   }
 }
 
-// OpenAI model info
-export interface OpenAIModel {
-  id: string
-  object: string
-  created: number
-  owned_by: string
-}
-
 // Plugin config
 export interface PluginConfig {
   rotationStrategy: 'sticky-threshold' | 'round-robin' | 'least-used' | 'random'
@@ -86,26 +93,6 @@ export interface PluginConfig {
   modelFilter: RegExp // Which models to expose
 }
 
-// OpenCode provider model definition
-export interface ProviderModel {
-  name: string
-  limit: {
-    context: number
-    output: number
-  }
-  modalities: {
-    input: string[]
-    output: string[]
-  }
-  options: {
-    reasoningEffort: string
-    reasoningSummary: string
-    textVerbosity: string
-    include: string[]
-    store: boolean
-  }
-}
-
 export const DEFAULT_CONFIG: PluginConfig = {
   rotationStrategy: 'sticky-threshold',
   autoRefreshTokens: true,
@@ -115,5 +102,5 @@ export const DEFAULT_CONFIG: PluginConfig = {
   stickyThresholdFiveHour: 0.7,
   stickyThresholdWeekly: 0.7,
   stickyRecoveryCheckIntervalMs: 60 * 60 * 1000,
-  modelFilter: /^gpt-5/
+  modelFilter: /^gpt-(5|6)/
 }

@@ -57,6 +57,31 @@ The first account is treated as primary. Additional accounts are fallbacks.
 - Recovery checks: while on fallback, periodically checks if primary recovered and switches back.
 - Safety skips: temporarily skips accounts that are rate-limited or have auth/model/workspace issues.
 
+## Models
+
+The plugin resolves the available models **per account** from the ChatGPT Codex
+catalog endpoint (`GET /backend-api/codex/models?client_version=...`) instead of
+hardcoding a list. The catalog is cached for 12 hours in the account store.
+
+- The OpenAI model picker is filtered to models the account can actually call
+  (via the `provider.models` hook).
+- Models retired from Codex with ChatGPT sign-in (`gpt-5`, `gpt-5.1`–`gpt-5.4`,
+  `gpt-5.2-codex`, `gpt-5.3-codex`, `gpt-5.5-pro`, `gpt-5.6`, …) are automatically
+  remapped to a working model for that account.
+- Requests always stream: the Codex backend rejects `stream: false` with
+  `"Stream must be set to true"`. Non-streaming callers are served by converting
+  the SSE response to JSON.
+
+Relevant environment variables:
+
+- `OPENCODE_MULTI_AUTH_CODEX_LATEST_MODEL` — force the model used when remapping
+  retired/unknown requests (default: `gpt-6-astra` when the account has it,
+  otherwise the account's highest-priority catalog model).
+- `OPENCODE_MULTI_AUTH_CODEX_CLIENT_VERSION` — override the client version sent
+  to the catalog endpoint (defaults to a recent Codex CLI version).
+- `OPENCODE_MULTI_AUTH_LIMITS_PROBE_MODELS` — comma-separated models used when
+  probing rate limits (defaults to the first three catalog models).
+
 ## Storage
 
 Credentials and runtime state are stored in:
