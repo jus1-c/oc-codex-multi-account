@@ -79,8 +79,9 @@ Relevant environment variables:
   otherwise the account's highest-priority catalog model).
 - `OPENCODE_MULTI_AUTH_CODEX_CLIENT_VERSION` — override the client version sent
   to the catalog endpoint (defaults to a recent Codex CLI version).
-- `OPENCODE_MULTI_AUTH_LIMITS_PROBE_MODELS` — comma-separated models used when
-  probing rate limits (defaults to the first three catalog models).
+
+Rate limits are read from the ChatGPT usage endpoint
+(`GET /backend-api/wham/usage`), which needs no Codex CLI and consumes no tokens.
 
 ## Storage
 

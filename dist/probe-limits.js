@@ -1,160 +1,65 @@
-import * as fs from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
-import { spawn } from 'node:child_process';
-import { findLatestSessionRateLimits } from './sessions-limits.js';
-import { getCatalogSlugs } from './models.js';
-const CODEX_HOME_ROOT = path.join(os.homedir(), '.codex-multi');
-const CODEX_CONFIG_PATH = path.join(os.homedir(), '.codex', 'config.toml');
-const DEFAULT_PROMPT = 'Reply ONLY with OK. Do not run any commands.';
-const EXEC_TIMEOUT_MS = 120_000;
-function ensureDir(dir) {
-    if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    }
+// ChatGPT usage endpoint: returns the rate-limit windows (and per-model
+// availability) without consuming tokens. This replaces spawning the `codex`
+// CLI, which fails with ENOENT when the CLI isn't installed.
+const USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
+const USAGE_TIMEOUT_MS = 30_000;
+const WEEK_SECONDS = 7 * 24 * 60 * 60;
+function buildWindow(window, now) {
+    if (!window)
+        return undefined;
+    const remaining = typeof window.used_percent === 'number' ? Math.max(0, 100 - window.used_percent) : undefined;
+    const resetAt = typeof window.reset_at === 'number' && window.reset_at > 0
+        ? window.reset_at * 1000
+        : typeof window.reset_after_seconds === 'number'
+            ? now + window.reset_after_seconds * 1000
+            : undefined;
+    return { limit: 100, remaining, resetAt, updatedAt: now };
 }
-function sanitizeAlias(alias) {
-    return alias.replace(/[^a-zA-Z0-9._-]/g, '_');
-}
-function getAliasHome(alias) {
-    return path.join(CODEX_HOME_ROOT, sanitizeAlias(alias));
-}
-function writeAuthJson(dir, account) {
-    if (!account.accessToken || !account.refreshToken || !account.idToken) {
-        throw new Error('Missing tokens for alias');
-    }
-    const auth = {
-        OPENAI_API_KEY: null,
-        tokens: {
-            id_token: account.idToken,
-            access_token: account.accessToken,
-            refresh_token: account.refreshToken,
-            account_id: account.accountId
-        },
-        last_refresh: new Date().toISOString()
-    };
-    const authPath = path.join(dir, 'auth.json');
-    fs.writeFileSync(authPath, JSON.stringify(auth, null, 2), { mode: 0o600 });
-}
-function copyConfigToml(dir) {
-    if (!fs.existsSync(CODEX_CONFIG_PATH))
-        return;
-    const target = path.join(dir, 'config.toml');
-    try {
-        fs.copyFileSync(CODEX_CONFIG_PATH, target);
-    }
-    catch {
-        // ignore config copy errors
-    }
-}
-function shouldRetryWithFallback(error) {
-    if (!error)
-        return false;
-    const text = error.toLowerCase();
-    return (text.includes('model_not_found') ||
-        text.includes('model is not supported') ||
-        text.includes('requested model') ||
-        text.includes('does not exist'));
-}
-function getProbeModels(account) {
-    const raw = (process.env.OPENCODE_MULTI_AUTH_LIMITS_PROBE_MODELS || '').trim();
-    const fromEnv = raw
-        .split(',')
-        .map((item) => item.trim())
-        .filter(Boolean);
-    const candidates = fromEnv.length > 0 ? fromEnv : getCatalogSlugs(account).slice(0, 3);
-    return Array.from(new Set(candidates));
-}
-async function runCodexExec(codexHome, model) {
-    return new Promise((resolve) => {
-        const args = [
-            'exec',
-            '--skip-git-repo-check',
-            '--cd',
-            codexHome,
-            '--sandbox',
-            'read-only'
-        ];
-        if (model) {
-            args.push('-m', model);
-        }
-        args.push(DEFAULT_PROMPT);
-        let stderr = '';
-        let stdout = '';
-        const child = spawn('codex', args, {
-            env: { ...process.env, CODEX_HOME: codexHome },
-            stdio: ['ignore', 'pipe', 'pipe']
-        });
-        const timer = setTimeout(() => {
-            child.kill('SIGTERM');
-            resolve({ ok: false, error: 'codex exec timed out' });
-        }, EXEC_TIMEOUT_MS);
-        child.stdout.on('data', (data) => {
-            stdout += data.toString();
-            if (stdout.length > 4000)
-                stdout = stdout.slice(-4000);
-        });
-        child.stderr.on('data', (data) => {
-            stderr += data.toString();
-            if (stderr.length > 4000)
-                stderr = stderr.slice(-4000);
-        });
-        child.on('error', (err) => {
-            clearTimeout(timer);
-            resolve({ ok: false, error: String(err) });
-        });
-        child.on('close', (code) => {
-            clearTimeout(timer);
-            if (code === 0) {
-                resolve({ ok: true });
-            }
-            else {
-                const message = stderr.trim() || stdout.trim() || `codex exec failed (code ${code})`;
-                resolve({ ok: false, error: message });
-            }
-        });
-    });
+function isWeeklyWindow(window) {
+    const seconds = window?.limit_window_seconds;
+    return typeof seconds === 'number' && seconds >= WEEK_SECONDS;
 }
 export async function probeRateLimitsForAccount(account) {
-    const codexHome = getAliasHome(account.alias);
-    ensureDir(codexHome);
-    writeAuthJson(codexHome, account);
-    copyConfigToml(codexHome);
-    const sessionsDir = path.join(codexHome, 'sessions');
-    const probeModels = getProbeModels(account);
-    let lastError = 'No token_count events found in alias sessions';
-    const attemptErrors = [];
-    for (let idx = 0; idx < probeModels.length; idx++) {
-        const probeModel = probeModels[idx];
-        const startedAt = Date.now();
-        const execResult = await runCodexExec(codexHome, probeModel);
-        const latest = findLatestSessionRateLimits({
-            sessionsDir,
-            sinceMs: startedAt - 5_000
+    if (!account.accessToken)
+        return { error: 'Missing access token' };
+    if (!account.accountId)
+        return { error: 'Missing account id' };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), USAGE_TIMEOUT_MS);
+    try {
+        const res = await fetch(USAGE_URL, {
+            headers: {
+                Authorization: `Bearer ${account.accessToken}`,
+                'chatgpt-account-id': account.accountId,
+                originator: 'codex_cli_rs'
+            },
+            signal: controller.signal
         });
-        if (latest?.rateLimits) {
-            return {
-                rateLimits: latest.rateLimits,
-                eventTs: latest.eventTs,
-                sourceFile: latest.sourceFile
-            };
+        if (!res.ok) {
+            return { error: `Usage request failed: HTTP ${res.status}` };
         }
-        if (execResult.error) {
-            lastError = execResult.error;
-            attemptErrors.push(`[model=${probeModel}] ${execResult.error}`);
+        const data = (await res.json());
+        const now = Date.now();
+        const primary = data.rate_limit?.primary_window;
+        const secondary = data.rate_limit?.secondary_window;
+        // The primary window is the short (5h) one and secondary is weekly, but
+        // classify by window length so a reordering upstream doesn't swap them.
+        const fiveHour = isWeeklyWindow(primary) ? secondary : primary;
+        const weekly = isWeeklyWindow(primary) ? primary : secondary;
+        const rateLimits = {
+            fiveHour: buildWindow(fiveHour, now),
+            weekly: buildWindow(weekly, now)
+        };
+        if (!rateLimits.fiveHour && !rateLimits.weekly) {
+            return { error: 'Usage response had no rate limit windows' };
         }
-        const hasNext = idx < probeModels.length - 1;
-        if (!hasNext)
-            break;
-        if (!shouldRetryWithFallback(execResult.error))
-            break;
+        return { rateLimits };
     }
-    if (attemptErrors.length > 0) {
-        return { error: attemptErrors[attemptErrors.length - 1] };
+    catch (err) {
+        return { error: err instanceof Error ? err.message : String(err) };
     }
-    return { error: lastError };
-}
-export function getProbeHomeRoot() {
-    return CODEX_HOME_ROOT;
+    finally {
+        clearTimeout(timer);
+    }
 }
 //# sourceMappingURL=probe-limits.js.map
